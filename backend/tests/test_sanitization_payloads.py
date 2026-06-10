@@ -3,6 +3,7 @@ test_sanitization_payloads.py — Parametrized security tests for XSS/injection 
 
 Complements test_sanitization.py with broader payload coverage.
 """
+
 from __future__ import annotations
 
 import json
@@ -17,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from app import main as app_main
+from app.middleware import _rate_limit_buckets
 from app.sanitize import sanitize_code_input, sanitize_result_json, sanitize_text_input
 from app.schemas import (
     ChatMessageRequest,
@@ -42,12 +44,14 @@ client = TestClient(app_main.app)
 
 @pytest.fixture(autouse=True)
 def reset_rate_limit():
-    app_main._request_counts.clear()
+    _rate_limit_buckets.clear()
     yield
-    app_main._request_counts.clear()
+    _rate_limit_buckets.clear()
 
 
-@pytest.mark.parametrize("payload", XSS_PAYLOADS + TEMPLATE_INJECTION_PAYLOADS + ENCODED_PAYLOADS)
+@pytest.mark.parametrize(
+    "payload", XSS_PAYLOADS + TEMPLATE_INJECTION_PAYLOADS + ENCODED_PAYLOADS
+)
 def test_sanitize_code_input_strips_null_and_ansi(payload: str):
     dirty = payload + "\x00\x1b[31m"
     cleaned = sanitize_code_input(dirty)
@@ -132,7 +136,9 @@ def test_favorite_create_request_sanitizes_title_and_code(payload: str):
 
 @pytest.mark.parametrize("payload", XSS_PAYLOADS + TEMPLATE_INJECTION_PAYLOADS)
 def test_chat_request_sanitizes_message_and_history(payload: str):
-    req = ChatRequest(message=payload, code=None, history=[payload, f"follow-up {payload}"])
+    req = ChatRequest(
+        message=payload, code=None, history=[payload, f"follow-up {payload}"]
+    )
     assert "\x00" not in req.message
     assert all("\x00" not in item for item in req.history)
 

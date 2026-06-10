@@ -4,10 +4,17 @@ import uuid
 from collections import defaultdict, deque
 from threading import Lock
 
-from fastapi import Request
+from fastapi import HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from .config import settings
+
+try:
+    from fastapi_limiter import FastAPILimiter
+    from fastapi_limiter.depends import RateLimiter
+except ImportError:  # pragma: no cover - exercised when optional deps are absent
+    FastAPILimiter = None
+    RateLimiter = None
 
 logger = logging.getLogger("ai_assistant.api")
 
@@ -74,6 +81,32 @@ async def request_size_limit_middleware(request: Request, call_next):
 
 
 async def rate_limit_middleware(request: Request, call_next):
+    limiter_response = Response()
+    await dynamic_rate_limiter(request, limiter_response)
+    response = await call_next(request)
+    response.headers.update(limiter_response.headers)
+    return response
+
+
+async def dynamic_rate_limiter(request: Request, response: Response):
+    """Use Redis-backed limits when initialized, otherwise fall back in memory."""
+    if (
+        FastAPILimiter is not None
+        and RateLimiter is not None
+        and getattr(FastAPILimiter, "redis", None) is not None
+    ):
+        try:
+            limiter = RateLimiter(
+                times=settings.rate_limit_requests,
+                seconds=settings.rate_limit_window_seconds,
+            )
+            await limiter(request=request, response=response)
+            return
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("redis_rate_limit_failed detail=%s", str(exc))
+
     client_key = get_client_key(request)
     now = time.time()
     cutoff = now - settings.rate_limit_window_seconds
@@ -84,17 +117,21 @@ async def rate_limit_middleware(request: Request, call_next):
             bucket.popleft()
 
         if len(bucket) >= settings.rate_limit_requests:
-            return JSONResponse(
+            raise HTTPException(
                 status_code=429,
-                content={
-                    "error": "rate_limited",
-                    "detail": (
-                        f"Too many requests. Limit is {settings.rate_limit_requests} requests "
-                        f"per {settings.rate_limit_window_seconds} seconds."
-                    ),
+                detail=(
+                    f"Too many requests. Limit is {settings.rate_limit_requests} requests "
+                    f"per {settings.rate_limit_window_seconds} seconds."
+                ),
+                headers={
+                    "Retry-After": str(settings.rate_limit_window_seconds),
+                    "X-RateLimit-Limit": str(settings.rate_limit_requests),
+                    "X-RateLimit-Remaining": "0",
                 },
             )
 
         bucket.append(now)
+        remaining = settings.rate_limit_requests - len(bucket)
 
-    return await call_next(request)
+    response.headers["X-RateLimit-Limit"] = str(settings.rate_limit_requests)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)

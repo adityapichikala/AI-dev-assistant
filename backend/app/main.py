@@ -3,17 +3,23 @@ QyverixAI — Backend API
 FastAPI application with advanced middleware, rate limiting, and full analysis engine.
 """
 
-from fastapi import FastAPI, Request
+import logging
+import os
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-import time
-import os
-from collections import defaultdict
-import logging
-from contextlib import asynccontextmanager
 
+from .config import settings
+from .middleware import dynamic_rate_limiter
+from .observability import (
+    initialise_app_info,
+    prometheus_metrics_middleware,
+)
 from .routers import (
     analyze,
     auth,
@@ -29,40 +35,16 @@ from .routers import (
 )
 from .routers import health as health_router
 from .routers import metrics as metrics_router
+from .schemas import HealthResponse
 from .services import database
 from .services.scheduler import start_scheduler, stop_scheduler
-from .observability import (
-    initialise_app_info,
-    prometheus_metrics_middleware,
-)
 
-from .schemas import HealthResponse
-
-
-# ── Rate limiter (in-memory, per IP) ──────────────────────────────────────────
-RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
-RATE_LIMIT_WINDOW_SECONDS = 60
-_request_counts: dict[str, list[float]] = defaultdict(list)
-
-
-def check_rate_limit(ip: str) -> int:
-    """Record a request and return the remaining requests in the current window."""
-    now = time.time()
-    _request_counts[ip] = [
-        t for t in _request_counts[ip] if now - t < RATE_LIMIT_WINDOW_SECONDS
-    ]
-    if len(_request_counts[ip]) >= RATE_LIMIT:
-        return -1
-    _request_counts[ip].append(now)
-    return RATE_LIMIT - len(_request_counts[ip])
-
-
-def rate_limit_headers(remaining: int) -> dict[str, str]:
-    """Build rate limit headers for API responses."""
-    return {
-        "X-RateLimit-Limit": str(RATE_LIMIT),
-        "X-RateLimit-Remaining": str(max(remaining, 0)),
-    }
+try:
+    import redis.asyncio as redis
+    from fastapi_limiter import FastAPILimiter
+except ImportError:  # pragma: no cover - exercised when optional deps are absent
+    redis = None
+    FastAPILimiter = None
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -70,8 +52,25 @@ def rate_limit_headers(remaining: int) -> dict[str, str]:
 async def lifespan(app: FastAPI):
     await database.init_db()
     print("🚀 QyverixAI backend starting…")
+    logging.getLogger(__name__).info("QyverixAI backend starting")
+
+    if settings.redis_url and redis is not None and FastAPILimiter is not None:
+        try:
+            redis_client = redis.from_url(
+                settings.redis_url, encoding="utf-8", decode_responses=True
+            )
+            await redis_client.ping()
+            await FastAPILimiter.init(redis_client)
+            logging.getLogger(__name__).info("Redis rate limiter initialized")
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "redis_rate_limiter_init_failed detail=%s", str(exc)
+            )
+
     # Static info gauge so dashboards can pin version / provider labels.
-    initialise_app_info(version="3.0.0", ai_provider=os.getenv("AI_PROVIDER", "rule-based"))
+    initialise_app_info(
+        version="3.0.0", ai_provider=os.getenv("AI_PROVIDER", "rule-based")
+    )
     start_scheduler()
     yield
     stop_scheduler()
@@ -110,29 +109,9 @@ app.middleware("http")(prometheus_metrics_middleware)
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
     start = time.perf_counter()
-    ip = request.client.host if request.client else "unknown"
-    remaining = RATE_LIMIT
-
-    # Apply rate limiting to analysis endpoints only
-    if request.url.path in ("/explanation/", "/debugging/", "/suggestions/", "/analyze/"):
-        remaining = check_rate_limit(ip)
-        if remaining < 0:
-            elapsed = (time.perf_counter() - start) * 1000
-            headers = rate_limit_headers(0)
-            headers["Retry-After"] = str(RATE_LIMIT_WINDOW_SECONDS)
-            headers["X-Process-Time-Ms"] = f"{elapsed:.2f}"
-            headers["X-QyverixAI-Version"] = "3.0.0"
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "detail": f"Rate limit exceeded. Max {RATE_LIMIT} requests/minute."
-                },
-                headers=headers,
-            )
 
     response = await call_next(request)
     elapsed = (time.perf_counter() - start) * 1000
-    response.headers.update(rate_limit_headers(remaining))
     response.headers["X-Process-Time-Ms"] = f"{elapsed:.2f}"
     response.headers["X-QyverixAI-Version"] = "3.0.0"
     return response
@@ -149,17 +128,37 @@ async def add_cache_header(request: Request, call_next):
 
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-app.include_router(explanation.router, prefix="/explanation", tags=["Explanation"])
-app.include_router(debugging.router,   prefix="/debugging",   tags=["Debugging"])
-app.include_router(suggestions.router, prefix="/suggestions", tags=["Suggestions"])
-app.include_router(analyze.router,     prefix="/analyze",     tags=["Full Analysis"])
-app.include_router(subscribe.router,   prefix="/subscribe",   tags=["Subscription"])
-app.include_router(history.router,     prefix="/history",     tags=["History"])
+app.include_router(
+    explanation.router,
+    prefix="/explanation",
+    tags=["Explanation"],
+    dependencies=[Depends(dynamic_rate_limiter)],
+)
+app.include_router(
+    debugging.router,
+    prefix="/debugging",
+    tags=["Debugging"],
+    dependencies=[Depends(dynamic_rate_limiter)],
+)
+app.include_router(
+    suggestions.router,
+    prefix="/suggestions",
+    tags=["Suggestions"],
+    dependencies=[Depends(dynamic_rate_limiter)],
+)
+app.include_router(
+    analyze.router,
+    prefix="/analyze",
+    tags=["Full Analysis"],
+    dependencies=[Depends(dynamic_rate_limiter)],
+)
+app.include_router(subscribe.router, prefix="/subscribe", tags=["Subscription"])
+app.include_router(history.router, prefix="/history", tags=["History"])
 app.include_router(auth.router)
 app.include_router(chat.router)
 app.include_router(share.router)
 app.include_router(user_data.router)
-app.include_router(upload_file.router, prefix="/upload",      tags=['Upload File'] )
+app.include_router(upload_file.router, prefix="/upload", tags=["Upload File"])
 
 
 # Operational endpoints: /healthz/live, /healthz/ready, /metrics
